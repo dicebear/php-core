@@ -369,28 +369,33 @@ class Renderer
             return '';
         }
 
-        $attrs = $this->renderAttributes(
-            $this->attributesWithoutAnimatedOpacity($element->attributes(), $element),
-        );
         $children = $this->renderElements($element->children());
 
-        if (strlen($children) === 0) {
-            // A wrapper whose children all rendered to nothing, because an
-            // optional component came up empty, has no content left to group.
-            // It draws nothing either way, but a masked group without content
-            // has an empty bounding box, and strict SVG parsers reject the
-            // whole document over it. Wrappers that carry an id stay, so
-            // references keep resolving.
-            $ownAttributes = $element->attributes();
+        // A wrapper whose children all rendered to nothing, because an
+        // optional component came up empty, has no content left to group.
+        // It draws nothing either way, but a masked group without content
+        // has an empty bounding box, and strict SVG parsers reject the
+        // whole document over it. Wrappers that carry an id stay, so
+        // references keep resolving.
+        $ownAttributes = $element->attributes();
 
-            if (count($element->children()) > 0 && !isset($ownAttributes['id'])) {
-                return '';
-            }
-
-            return $this->applyAnimations("<{$name}{$attrs}/>", $element);
+        if (strlen($children) === 0 && count($element->children()) > 0 && !isset($ownAttributes['id'])) {
+            return '';
         }
 
-        return $this->applyAnimations("<{$name}{$attrs}>{$children}</{$name}>", $element);
+        // The animation switches are read once the element is known to
+        // render, after its children, so the resolved options record them in
+        // one order regardless of the attributes the element carries.
+        $active = $this->activeAnimations($element);
+        $attrs = $this->renderAttributes(
+            $this->attributesWithoutAnimatedOpacity($ownAttributes, $active),
+        );
+
+        if (strlen($children) === 0) {
+            return $this->applyAnimations("<{$name}{$attrs}/>", $element, $active);
+        }
+
+        return $this->applyAnimations("<{$name}{$attrs}>{$children}</{$name}>", $element, $active);
     }
 
     /**
@@ -452,7 +457,8 @@ class Renderer
         }
 
         $transforms = $this->buildTransforms($component);
-        $userAttributes = $this->attributesWithoutAnimatedOpacity($element->attributes(), $element);
+        $active = $this->activeAnimations($element);
+        $userAttributes = $this->attributesWithoutAnimatedOpacity($element->attributes(), $active);
         $mergedAttributes = $userAttributes;
 
         if (count($transforms) > 0) {
@@ -467,7 +473,7 @@ class Renderer
 
         $attrs = $this->renderAttributes($mergedAttributes);
 
-        return $this->applyAnimations("<use{$attrs} href=\"#{$id}\"/>", $element);
+        return $this->applyAnimations("<use{$attrs} href=\"#{$id}\"/>", $element, $active);
     }
 
     /**
@@ -674,12 +680,11 @@ class Renderer
     /**
      * Returns the FNV-1a hex hash namespacing the animation class and
      * keyframe names, cached after the first call. Extends the
-     * {@see hashSeed} input with the animation speed and, for a by-name
-     * selection, the sorted names: two renders of the same avatar with
-     * different speeds or selections inlined on one page must not select each
-     * other's rules, while identical renders sharing identical rules is
-     * harmless deduplication. `true` adds no name suffix, so enabling all
-     * animations hashes as before.
+     * {@see hashSeed} input with the global speed and delay and with the
+     * state of every named timeline: two renders of the same avatar with
+     * different speeds or per-name switches inlined on one page must not
+     * select each other's rules, while identical renders sharing identical
+     * rules is harmless deduplication.
      *
      * Everything else about an avatar stays out of the hash, so two renders
      * of the same style and seed that differ in any other option would share
@@ -694,31 +699,39 @@ class Renderer
             return $this->cachedAnimationHash;
         }
 
-        $selection = $this->resolver->animation();
-        $names = '';
+        $random = $this->resolver->idRandomization() ? ':' . $this->randomSuffix() : '';
 
-        if (is_array($selection)) {
-            $distinct = array_values(array_unique($selection));
-            sort($distinct, SORT_STRING);
-            $names = ':' . implode(',', $distinct);
+        // Every named timeline the style carries joins the hash with its
+        // state, `off` or the factor and offset it plays at, so two renders
+        // that differ only in a per-name animation option never share their
+        // rules. The style lists its names in byte order already.
+        $states = [];
+
+        foreach ($this->style->animationNames() as $name) {
+            $states[] = $this->resolver->animationPlays($name)
+                ? $name
+                    . ':' . Number::format($this->resolver->animationSpeedFor($name))
+                    . ':' . Number::format($this->resolver->animationDelayFor($name))
+                : $name . ':off';
         }
 
-        $random = $this->resolver->idRandomization() ? ':' . $this->randomSuffix() : '';
+        $named = count($states) > 0 ? ':' . implode(',', $states) : '';
 
         return $this->cachedAnimationHash = Fnv1a::hex(
             ($this->style->meta()->source()->name() ?? '')
             . ':' . $this->resolver->seed()
             . ':' . Number::format($this->resolver->animationSpeed())
-            . $names
+            . ':' . Number::format($this->resolver->animationDelay())
+            . $named
             . $random
         );
     }
 
     /**
-     * Returns the animation blocks of an element that the `animation` option
-     * selects. The element check comes first: only styles that carry
-     * declarative animations may touch the option, so the resolved-options
-     * snapshot of every other avatar stays free of it.
+     * Returns the animation blocks of an element that play. The element check
+     * comes first: only styles that carry declarative animations may touch
+     * the options, so the resolved-options snapshot of every other avatar
+     * stays free of them.
      *
      * @return list<array<string, mixed>>
      */
@@ -730,22 +743,14 @@ class Renderer
             return $animations;
         }
 
-        $selection = $this->resolver->animation();
-
-        // `true` plays every timeline. A name list plays only the timelines
-        // carrying one of those names, so unnamed timelines stay static then.
-        if ($selection === true) {
-            return $animations;
-        }
-
-        if ($selection === false) {
-            return [];
-        }
+        // The global switch is read first so it lands in the resolved options
+        // whenever a node carries animations, on or off. Named timelines then
+        // follow their own switch when the user set one.
+        $this->resolver->animation();
 
         return array_values(array_filter(
             $animations,
-            static fn(array $animation) => isset($animation['name'])
-                && in_array($animation['name'], $selection, true),
+            fn(array $animation) => $this->resolver->animationPlays($animation['name'] ?? null),
         ));
     }
 
@@ -759,19 +764,20 @@ class Renderer
      * where the keyframes override it. With the animation off no wrapper
      * exists and the attribute stays where it is.
      *
+     * `$active` is the element's playing animations as `activeAnimations()`
+     * returns them, read once by the caller and shared with the wrapper step.
+     *
      * @param array<string, mixed>|null $attributes
+     * @param list<array<string, mixed>> $active
      * @return array<string, mixed>|null
      */
-    private function attributesWithoutAnimatedOpacity(?array $attributes, Element $element): ?array
+    private function attributesWithoutAnimatedOpacity(?array $attributes, array $active): ?array
     {
-        // The element check comes first: only styles that carry declarative
-        // animations may touch the `animation` option, so the resolved-options
-        // snapshot of every other avatar stays free of it.
-        if (!isset($attributes['opacity']) || count($element->animations()) === 0) {
+        if (!isset($attributes['opacity'])) {
             return $attributes;
         }
 
-        foreach ($this->activeAnimations($element) as $animation) {
+        foreach ($active as $animation) {
             if (isset($animation['tracks']['opacity'])) {
                 unset($attributes['opacity']);
 
@@ -784,27 +790,22 @@ class Renderer
 
     /**
      * Wraps an element's rendered markup in one `<g class="…">` per animation
-     * track and queues the matching CSS. A no-op when the `animation` option
-     * is off, the element carries no animations, or its markup rendered to
-     * nothing (the empty-wrapper pruning then also prunes the animation).
+     * track and queues the matching CSS. A no-op when no animation plays on
+     * the element (`$active` empty) or its markup rendered to nothing (the
+     * empty-wrapper pruning then also prunes the animation).
      *
      * Wrapper nesting is block 0 outermost, and within a block the canonical
      * track order (translate before rotate before scale, opacity innermost) —
-     * the composition contract the Figma plugin maps onto node transforms.
+     * the composition contract the plugin for Figma maps onto node transforms.
      *
      * The element's own `opacity` rides on the innermost opacity wrapper as
      * the resting value the keyframes then override.
      *
+     * @param list<array<string, mixed>> $active
      */
-    private function applyAnimations(string $markup, Element $element): string
+    private function applyAnimations(string $markup, Element $element, array $active): string
     {
-        if ($markup === '') {
-            return $markup;
-        }
-
-        $active = $this->activeAnimations($element);
-
-        if (count($active) === 0) {
+        if ($markup === '' || count($active) === 0) {
             return $markup;
         }
 
@@ -862,9 +863,13 @@ class Renderer
             $this->keyframesCss[] = "@keyframes {$keyframesName}{" . $body . '}';
         }
 
-        $speed = $this->resolver->animationSpeed();
+        $speed = $this->resolver->animationSpeedFor($animation['name'] ?? null);
         $duration = Number::format($animation['duration'] / $speed);
-        $delay = Number::format(($animation['delay'] ?? 0) / $speed);
+        // The user's offset is in seconds of playback, so it is added after
+        // the speed has scaled the authored delay.
+        $delay = Number::format(
+            ($animation['delay'] ?? 0) / $speed + $this->resolver->animationDelayFor($animation['name'] ?? null),
+        );
         $iterations = !isset($animation['iterations']) || $animation['iterations'] === 'infinite'
             ? 'infinite'
             : Number::format($animation['iterations']);

@@ -60,18 +60,72 @@ class Resolver
         return $this->memo('idRandomization', fn() => $this->options->idRandomization() ?? false);
     }
 
-    /** @return bool|list<string> */
-    public function animation(): bool|array
+    public function animation(): bool
     {
-        // Deliberately without PRNG involvement — whether and what animates
-        // must not depend on the seed. `true` plays every timeline, a name
-        // list only the timelines carrying one of those names.
+        // Deliberately without PRNG involvement: whether an avatar animates
+        // must not depend on the seed.
         return $this->memo('animation', fn() => $this->options->animation() ?? false);
+    }
+
+    /**
+     * Whether one timeline plays. A named timeline follows its
+     * `${name}Animation` switch when the user set one, recorded under that
+     * key, and the global `animation` switch otherwise. Unnamed timelines
+     * always follow the global switch.
+     */
+    public function animationPlays(?string $name): bool
+    {
+        $value = $name === null ? null : $this->options->animationFor($name);
+
+        if ($name === null || $value === null) {
+            return $this->animation();
+        }
+
+        return $this->memo("{$name}Animation", fn() => $value);
     }
 
     public function animationSpeed(): float
     {
         return $this->memoFloat('animationSpeed', $this->options->animationSpeed(), 1.0);
+    }
+
+    /**
+     * Returns the speed factor of one timeline. A named timeline plays at its
+     * `${name}AnimationSpeed` option when the user set one, drawn under that
+     * key, and at the global factor otherwise. Unnamed timelines always
+     * follow the global factor.
+     */
+    public function animationSpeedFor(?string $name): float
+    {
+        $range = $name === null ? null : $this->options->animationSpeedFor($name);
+
+        if ($name === null || $range === null) {
+            return $this->animationSpeed();
+        }
+
+        return $this->memoFloat("{$name}AnimationSpeed", $range, 1.0);
+    }
+
+    public function animationDelay(): float
+    {
+        return $this->memoFloat('animationDelay', $this->options->animationDelay(), 0.0);
+    }
+
+    /**
+     * Returns the start offset of one timeline in seconds. A named timeline
+     * uses its `${name}AnimationDelay` option when the user set one, drawn
+     * under that key, and the global offset otherwise. Unnamed timelines
+     * always follow the global offset.
+     */
+    public function animationDelayFor(?string $name): float
+    {
+        $range = $name === null ? null : $this->options->animationDelayFor($name);
+
+        if ($name === null || $range === null) {
+            return $this->animationDelay();
+        }
+
+        return $this->memoFloat("{$name}AnimationDelay", $range, 0.0);
     }
 
     public function title(): ?string
@@ -439,12 +493,11 @@ class Resolver
      * circular references between colors and throws
      * {@see CircularColorReferenceError}.
      *
-     * A user-set `${name}ColorOrder: 'fixed'` pins user-supplied colors to
-     * their verbatim order: the shuffle and the contrast sort are skipped
-     * (`notEqualTo` filtering still applies), and the gradient stop count
-     * defaults to the number of supplied colors instead of 2. A style palette
-     * carries no order contract, so with `fixed` it is still deduplicated,
-     * code-point sorted, and contrast sorted; only the shuffle is skipped.
+     * A user-set `${name}ColorOrder: 'fixed'` pins the candidates to their
+     * given order, whether they come from the option or from the style's
+     * palette: the shuffle and the contrast sort are skipped (`notEqualTo`
+     * filtering still applies), and the gradient stop count defaults to the
+     * number of candidates instead of 2.
      *
      * @return list<string>
      */
@@ -457,12 +510,11 @@ class Resolver
 
         $candidates = array_map(fn($c) => ColorUtil::toHex($c), $source);
         $fixed = $this->colorOrder($name) === Options::COLOR_ORDER_FIXED;
-        $verbatim = $userColors !== null && $fixed;
         $fill = $this->colorFill($name);
-        $stops = $fill === 'solid' ? 1 : $this->colorFillStops($name, $verbatim ? count($candidates) : 2);
+        $stops = $fill === 'solid' ? 1 : $this->colorFillStops($name, $fixed ? count($candidates) : 2);
 
         if ($styleColor === null) {
-            return array_slice($this->order($name, $candidates, $fixed, $verbatim), 0, $stops);
+            return array_slice($this->order($name, $candidates, $fixed), 0, $stops);
         }
 
         // Detect circular references (e.g. a.contrastTo = b, b.contrastTo = a)
@@ -475,7 +527,7 @@ class Resolver
         $notEqualTo = $styleColor->notEqualTo();
 
         try {
-            if ($contrastTo !== null && !$verbatim) {
+            if ($contrastTo !== null && !$fixed) {
                 $refColor = $this->color($contrastTo)[0] ?? null;
 
                 if ($refColor !== null) {
@@ -501,41 +553,22 @@ class Resolver
         // Skip shuffle when sorted by contrast to preserve the ordering
         $ordered = $contrastTo !== null
             ? $candidates
-            : $this->order($name, $candidates, $fixed, $verbatim);
+            : $this->order($name, $candidates, $fixed);
 
         return array_slice($ordered, 0, $stops);
     }
 
     /**
      * Applies `${name}ColorOrder` to the candidate list. `random` shuffles via
-     * the PRNG. `fixed` skips the shuffle: user-supplied colors (`$verbatim`)
-     * keep exactly the given order, while a style palette is still
-     * deduplicated and sorted by UTF-16 code units, matching the
-     * canonicalization the shuffle applies before drawing.
+     * the PRNG, `fixed` keeps the candidates as given, duplicates included.
      *
      * @param list<string> $candidates
      *
      * @return list<string>
      */
-    private function order(string $name, array $candidates, bool $fixed, bool $verbatim): array
+    private function order(string $name, array $candidates, bool $fixed): array
     {
-        if (!$fixed) {
-            return $this->prng->shuffle("{$name}Color", $candidates);
-        }
-
-        if ($verbatim) {
-            return $candidates;
-        }
-
-        // Hex colors are ASCII, so a byte sort equals the UTF-16 code unit
-        // sort the JS reference applies.
-        // Deprecated: DiceBear 11 will take the palette in its definition
-        // order here, the same verbatim rule as user-supplied colors, and
-        // drop this sort (see CHANGELOG.md, "Deprecated").
-        $unique = array_values(array_unique($candidates));
-        sort($unique, SORT_STRING);
-
-        return $unique;
+        return $fixed ? $candidates : $this->prng->shuffle("{$name}Color", $candidates);
     }
 
     private function colorFillStops(string $name, int $fallback): int
